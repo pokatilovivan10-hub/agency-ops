@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const app = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+const css = readFileSync(new URL('../public/app.css', import.meta.url), 'utf8');
+
+test('theme toggle persists and is available in the CRM shell', () => {
+  assert.match(app, /THEME_KEY='crmTheme'/);
+  assert.match(app, /data-theme-toggle/);
+  assert.match(app, /localStorage\.setItem\(THEME_KEY,next\)/);
+  assert.match(css, /html\[data-theme=dark\]/);
+});
+
+test('mobile sales keeps navigation and touch targets usable', () => {
+  assert.match(css, /\.shell:has\(\.sales-board\) \.topbar\{display:flex\}/);
+  assert.match(css, /\.mobile-menu\{[^}]*min-width:44px;min-height:44px/);
+  assert.match(css, /\.lead-advance\{width:44px;height:44px/);
+  assert.match(css, /\.field input,\.field select,\.field textarea\{font-size:16px/);
+});
