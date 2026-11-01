@@ -38,10 +38,12 @@ html[data-theme=dark] .lead-tile.overdue,html[data-theme=dark] .focus-task.dange
 html[data-theme=dark] .next-action{background:#14271f}html[data-theme=dark] .next-action.danger{background:#2a181e}
 html[data-theme=dark] .deadline{background:#14221d}html[data-theme=dark] .deadline.warn{background:#292116}html[data-theme=dark] .deadline.danger,html[data-theme=dark] .escalation{background:#29191e}
 html[data-theme=dark] .progress{background:#29313c}html[data-theme=dark] .event{border-color:#323b47}
+.user-profile{width:100%;min-height:52px;display:flex;align-items:center;gap:10px;border:0;border-radius:11px;background:transparent;color:#fff;padding:7px;text-align:left}.user-profile:hover,.user-profile.active{background:#252a33}.user-avatar{width:34px;height:34px;display:grid;place-items:center;flex:0 0 34px;border-radius:50%;background:#e72b2b;color:#fff;font-size:13px;font-weight:900}.user-copy{min-width:0}.user-profile strong,.user-profile small{overflow:hidden;text-overflow:ellipsis}.user-profile small{margin-top:1px}.logout{width:100%;text-align:left;padding-left:7px}.sidebar-collapsed .user-profile{justify-content:center;padding-left:0;padding-right:0}.sidebar-collapsed .user-avatar{width:36px;height:36px;flex-basis:36px}.sidebar-collapsed .logout{text-align:center;padding-left:0}
 
 @media(max-width:720px){
   .sidebar,.sidebar-collapsed .sidebar{width:min(82vw,300px);padding-top:max(20px,env(safe-area-inset-top));padding-bottom:max(18px,env(safe-area-inset-bottom))}
   .sidebar-collapsed .theme-toggle{font-size:14px;text-align:left;padding:11px 12px}.sidebar-collapsed .theme-toggle span{width:23px;font-size:inherit}
+  .sidebar-collapsed .user-profile{justify-content:flex-start;padding:7px}.sidebar-collapsed .user-copy{display:block}.sidebar-collapsed .logout{text-align:left;padding-left:7px}
   .menu-scrim{display:block;position:fixed;inset:0;z-index:25;border:0;background:rgba(3,5,8,.58);opacity:0;pointer-events:none;transition:opacity .2s}.menu-scrim.open{opacity:1;pointer-events:auto}
   .mobile-menu{align-items:center;justify-content:center;min-width:44px;min-height:44px;font-size:20px}
   .topbar{height:60px;padding:0 12px;gap:8px}.topbar h1{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:18px}.topbar>div{margin-left:auto}

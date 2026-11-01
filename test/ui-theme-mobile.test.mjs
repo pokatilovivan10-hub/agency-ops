@@ -18,3 +18,10 @@ test('mobile sales keeps navigation and touch targets usable', () => {
   assert.match(css, /\.lead-advance\{width:44px;height:44px/);
   assert.match(css, /\.field input,\.field select,\.field textarea\{font-size:16px/);
 });
+
+test('profile opens from the account block instead of a duplicate nav item', () => {
+  assert.doesNotMatch(app, /<button data-view="account"/);
+  assert.match(app, /id="userProfile" title="Открыть профиль"/);
+  assert.match(app, /\$\('#userProfile'\)\.onclick=\(\)=>navigate\('account'\)/);
+  assert.match(css, /\.user-profile\{[^}]*min-height:52px/);
+});
