@@ -12,7 +12,9 @@ const COOKIE_NAME = 'agency_ops_session';
 const SESSION_TTL = 30 * 86400;
 const INTEGRATION_TOKEN = process.env.INTEGRATION_TOKEN || '';
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 5_000_000);
+const PUBLIC_LEAD_ORIGINS = new Set(String(process.env.PUBLIC_LEAD_ORIGINS || 'https://digital-red.ru,https://www.digital-red.ru,https://v753842.hosted-by-vdsina.com').split(',').map(v=>v.trim()).filter(Boolean));
 const LEAD_STAGES = new Set(['new','contacted','qualified','meeting','proposal','won','lost']);
+const publicLeadRate = new Map();
 mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(join(DATA_DIR, 'agency-ops.sqlite'));
 db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
@@ -161,6 +163,35 @@ function projectAccess(id,user) {
 }
 function route(pattern,path) { const keys=[]; const re=new RegExp('^'+pattern.replace(/:([A-Za-z]+)/g,(_,k)=>(keys.push(k),'([^/]+)'))+'$'); const m=path.match(re); return m?Object.fromEntries(keys.map((k,i)=>[k,decodeURIComponent(m[i+1])])):null; }
 function secureEqual(a,b) { const aa=Buffer.from(String(a||'')),bb=Buffer.from(String(b||'')); return aa.length===bb.length && timingSafeEqual(aa,bb); }
+function publicLeadCors(req) {
+  const origin=String(req.headers.origin||'');
+  return PUBLIC_LEAD_ORIGINS.has(origin)?{'access-control-allow-origin':origin,'access-control-allow-methods':'POST, OPTIONS','access-control-allow-headers':'content-type','vary':'Origin'}:null;
+}
+function publicLeadIp(req) { return String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',')[0].trim(); }
+function publicLeadRateAllowed(req) {
+  const now=Date.now(),ip=publicLeadIp(req),windowMs=10*60*1000;
+  const recent=(publicLeadRate.get(ip)||[]).filter(ts=>now-ts<windowMs);
+  if(recent.length>=8) { publicLeadRate.set(ip,recent); return false; }
+  recent.push(now); publicLeadRate.set(ip,recent); return true;
+}
+function cleanPublic(value,max=500) { return String(value||'').replace(/[\u0000-\u001f\u007f]/g,' ').replace(/\s+/g,' ').trim().slice(0,max); }
+function createPublicLead(input) {
+  const submissionId=cleanPublic(input.submission_id,80);
+  if(!/^[a-zA-Z0-9_-]{16,80}$/.test(submissionId)) throw Object.assign(new Error('Некорректный идентификатор отправки'),{status:400});
+  const existing=db.prepare('SELECT id FROM leads WHERE external_key=?').get(`website:${submissionId}`);
+  if(existing) return {id:existing.id,duplicate:true};
+  const phone=cleanPublic(input.phone,80),email=cleanPublic(input.email,160),contactName=cleanPublic(input.contact_name,160),website=cleanPublic(input.website,300);
+  if(!phone&&!email) throw Object.assign(new Error('Укажите телефон или email'),{status:400});
+  if(cleanPublic(input.website_trap,100)) throw Object.assign(new Error('Заявка отклонена'),{status:400});
+  const owner=db.prepare("SELECT id,name,role,login,must_change FROM users WHERE role='owner' AND active=1 ORDER BY id LIMIT 1").get();
+  if(!owner) throw Object.assign(new Error('Не найден активный собственник'),{status:409});
+  const sourcePage=cleanPublic(input.page,500),formName=cleanPublic(input.form_name,200),message=cleanPublic(input.message,1500),utm=cleanPublic(input.utm,1000);
+  const notes=[formName&&`Форма: ${formName}`,sourcePage&&`Страница: ${sourcePage}`,message&&`Сообщение: ${message}`,utm&&`UTM: ${utm}`].filter(Boolean).join('\n');
+  const today=new Date().toISOString().slice(0,10);
+  const company=contactName||website||email||phone||'Заявка с сайта';
+  const id=createLead({company,contact_name:contactName,phone,email,website,source:'digital-red.ru',service:cleanPublic(input.service,240)||'Заявка с сайта',lead_date:today,external_key:`website:${submissionId}`,stage:'new',qualification:'unqualified',owner_id:owner.id,next_action:'Связаться с лидом',next_action_due:today,need:message,notes},owner);
+  return {id,duplicate:false};
+}
 function findProjectByName(name) { const key=normalizeProjectName(name); return db.prepare('SELECT id,client,stage FROM projects WHERE archived=0 ORDER BY updated_at DESC').all().find(p=>normalizeProjectName(p.client)===key)||null; }
 function findLeadByName(name) { const key=normalizeProjectName(name); return db.prepare("SELECT id,company FROM leads WHERE stage NOT IN ('won','lost') ORDER BY updated_at DESC").all().find(p=>normalizeProjectName(p.company)===key)||null; }
 
@@ -274,6 +305,16 @@ function leadCard(id) {
 }
 
 async function api(req,res,path) {
+  if(path==='/api/public/leads' && req.method==='OPTIONS') {
+    const cors=publicLeadCors(req); return cors?json(res,200,{ok:true},cors):json(res,403,{error:'Домен не разрешён'});
+  }
+  if(path==='/api/public/leads' && req.method==='POST') {
+    const cors=publicLeadCors(req); if(!cors) return json(res,403,{error:'Домен не разрешён'});
+    if(!String(req.headers['content-type']||'').toLowerCase().includes('application/json')) return json(res,415,{error:'Ожидается JSON'},cors);
+    if(!publicLeadRateAllowed(req)) return json(res,429,{error:'Слишком много отправок. Попробуйте позже.'},cors);
+    try { const result=createPublicLead(await body(req)); return json(res,result.duplicate?200:201,{ok:true,...result},cors); }
+    catch(e) { return json(res,e.status||400,{error:e.message||'Не удалось отправить заявку'},cors); }
+  }
   if(req.method==='POST' && path==='/api/integrations/calls') {
     if(!INTEGRATION_TOKEN) return json(res,503,{error:'Интеграция созвонов пока не подключена'});
     const supplied=String(req.headers.authorization||'').replace(/^Bearer\s+/i,'');
