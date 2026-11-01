@@ -77,11 +77,36 @@ CREATE TABLE IF NOT EXISTS call_records (
   transcript TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', trigger_phrase TEXT NOT NULL DEFAULT '',
   occurred_at TEXT, created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS leads (
+  id INTEGER PRIMARY KEY, company TEXT NOT NULL, contact_name TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', service TEXT NOT NULL DEFAULT '',
+  lead_date TEXT, external_key TEXT UNIQUE,
+  stage TEXT NOT NULL DEFAULT 'new', qualification TEXT NOT NULL DEFAULT 'unqualified', owner_id INTEGER REFERENCES users(id),
+  budget TEXT NOT NULL DEFAULT '', need TEXT NOT NULL DEFAULT '', deadline TEXT NOT NULL DEFAULT '',
+  decision_maker TEXT NOT NULL DEFAULT '', next_action TEXT NOT NULL DEFAULT '', next_action_due TEXT,
+  last_contact_at TEXT, loss_reason TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+  source_project_id INTEGER UNIQUE REFERENCES projects(id), converted_project_id INTEGER REFERENCES projects(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS lead_activities (
+  id INTEGER PRIMARY KEY, lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id), type TEXT NOT NULL DEFAULT 'note', summary TEXT NOT NULL,
+  occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_handoff_project ON handoff_items(project_id);
 CREATE INDEX IF NOT EXISTS idx_launch_project ON launch_items(project_id);
 CREATE INDEX IF NOT EXISTS idx_activity_project ON activity(project_id);
 CREATE INDEX IF NOT EXISTS idx_calls_project ON call_records(project_id);
+CREATE INDEX IF NOT EXISTS idx_leads_stage ON leads(stage);
+CREATE INDEX IF NOT EXISTS idx_leads_owner ON leads(owner_id);
+CREATE INDEX IF NOT EXISTS idx_lead_activities_lead ON lead_activities(lead_id);
+`);
+
+db.exec(`
+INSERT OR IGNORE INTO leads(company,service,stage,qualification,owner_id,next_action,next_action_due,notes,source_project_id,created_at,updated_at)
+SELECT client,service,'new','unqualified',owner_id,next_action,next_action_due,call_summary,id,created_at,updated_at
+FROM projects WHERE stage='lead';
 `);
 
 const handoffTemplate = [
@@ -127,10 +152,27 @@ function auth(req) {
   return db.prepare(`SELECT u.id,u.name,u.role,u.login,u.must_change FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.active=1`).get(tokenHash(token),Math.floor(Date.now()/1000)) || null;
 }
 function activity(projectId,userId,action,details='') { db.prepare('INSERT INTO activity(project_id,user_id,action,details) VALUES(?,?,?,?)').run(projectId,userId,action,details); }
-function projectAccess(id) { return db.prepare(`SELECT p.*, o.name owner_name, m.name manager_name FROM projects p LEFT JOIN users o ON o.id=p.owner_id LEFT JOIN users m ON m.id=p.manager_id WHERE p.id=? AND p.archived=0`).get(id); }
+function canSeeSales(user) { return user?.role === 'owner'; }
+function projectAccess(id,user) {
+  const own = user?.role === 'specialist' ? ' AND (p.manager_id=? OR EXISTS (SELECT 1 FROM tasks at WHERE at.project_id=p.id AND at.assignee_id=?))' : '';
+  const params = user?.role === 'specialist' ? [id,user.id,user.id] : [id];
+  return db.prepare(`SELECT p.*, o.name owner_name, m.name manager_name FROM projects p LEFT JOIN users o ON o.id=p.owner_id LEFT JOIN users m ON m.id=p.manager_id WHERE p.id=? AND p.archived=0 AND p.stage!='lead'${own}`).get(...params);
+}
 function route(pattern,path) { const keys=[]; const re=new RegExp('^'+pattern.replace(/:([A-Za-z]+)/g,(_,k)=>(keys.push(k),'([^/]+)'))+'$'); const m=path.match(re); return m?Object.fromEntries(keys.map((k,i)=>[k,decodeURIComponent(m[i+1])])):null; }
 function secureEqual(a,b) { const aa=Buffer.from(String(a||'')),bb=Buffer.from(String(b||'')); return aa.length===bb.length && timingSafeEqual(aa,bb); }
-function findProjectByName(name) { const key=normalizeProjectName(name); return db.prepare('SELECT id,client FROM projects WHERE archived=0 ORDER BY updated_at DESC').all().find(p=>normalizeProjectName(p.client)===key)||null; }
+function findProjectByName(name) { const key=normalizeProjectName(name); return db.prepare('SELECT id,client,stage FROM projects WHERE archived=0 ORDER BY updated_at DESC').all().find(p=>normalizeProjectName(p.client)===key)||null; }
+function findLeadByName(name) { const key=normalizeProjectName(name); return db.prepare("SELECT id,company FROM leads WHERE stage NOT IN ('won','lost') ORDER BY updated_at DESC").all().find(p=>normalizeProjectName(p.company)===key)||null; }
+
+function createLead(input,user) {
+  if(!String(input.company||'').trim()) throw new Error('Укажите компанию или имя лида');
+  const r=db.prepare(`INSERT INTO leads(company,contact_name,phone,email,website,source,service,lead_date,external_key,stage,qualification,owner_id,budget,need,deadline,decision_maker,next_action,next_action_due,last_contact_at,loss_reason,notes)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    String(input.company).trim(),String(input.contact_name||'').trim(),String(input.phone||'').trim(),String(input.email||'').trim(),String(input.website||'').trim(),String(input.source||'').trim(),String(input.service||'').trim(),input.lead_date||null,input.external_key||null,
+    input.stage||'new',input.qualification||'unqualified',input.owner_id||user.id,String(input.budget||'').trim(),String(input.need||'').trim(),String(input.deadline||'').trim(),String(input.decision_maker||'').trim(),String(input.next_action||'').trim(),input.next_action_due||null,input.last_contact_at||null,String(input.loss_reason||'').trim(),String(input.notes||'').trim());
+  const id=Number(r.lastInsertRowid);
+  db.prepare('INSERT INTO lead_activities(lead_id,user_id,type,summary) VALUES(?,?,?,?)').run(id,user.id,'created','Лид добавлен в CRM');
+  return id;
+}
 
 function createProject(input,user) {
   if(!String(input.client||'').trim()) throw new Error('Укажите клиента');
@@ -170,28 +212,64 @@ function intakeCall(input,user) {
   }
   const projectName=extractProjectName(input);
   if(!projectName) throw new Error('В конце расшифровки нужна отдельная фраза «Проект <название>»');
-  let project=findProjectByName(projectName),created=false;
-  if(!project) {
-    const manager=db.prepare("SELECT id FROM users WHERE role='manager' AND active=1 ORDER BY id LIMIT 1").get();
-    const projectId=createProject({client:projectName,service:input.service||'',stage:'lead',manager_id:manager?.id||null,next_action:'Уточнить вводные после созвона',call_summary:input.summary||''},user);
-    project={id:projectId,client:projectName}; created=true;
+  const project=findProjectByName(projectName);
+  if(project && project.stage!=='lead') {
+    const call=addCallRecord(project.id,{...input,trigger_phrase:`Проект ${projectName}`},user);
+    return {kind:'project',project_id:project.id,project_name:project.client,project_created:false,...call};
   }
-  const call=addCallRecord(project.id,{...input,trigger_phrase:`Проект ${projectName}`},user);
-  return {project_id:project.id,project_name:project.client,project_created:created,...call};
+  let lead=findLeadByName(projectName),created=false;
+  if(!lead) {
+    const id=createLead({company:projectName,service:input.service||'',source:input.source||'Созвон',next_action:'Квалифицировать лид и назначить следующий контакт',notes:input.summary||input.transcript||''},user);
+    lead={id,company:projectName}; created=true;
+  }
+  const summary=String(input.summary||input.title||'Добавлен первичный созвон').trim();
+  db.prepare('INSERT INTO lead_activities(lead_id,user_id,type,summary,occurred_at) VALUES(?,?,?,?,COALESCE(?,CURRENT_TIMESTAMP))').run(lead.id,user.id,'call',summary,input.occurred_at||null);
+  db.prepare('UPDATE leads SET last_contact_at=COALESCE(?,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?').run(input.occurred_at||null,lead.id);
+  return {kind:'lead',lead_id:lead.id,lead_name:lead.company,lead_created:created,duplicate:false};
 }
 
-function dashboard() {
-  const counts=db.prepare(`SELECT COUNT(*) total, SUM(stage='lead') leads, SUM(stage='launched' OR stage='management') active, SUM(risk IN ('high','stop')) risks, SUM(acceptance_status!='accepted') handoffs FROM projects WHERE archived=0`).get();
-  const overdue=db.prepare(`SELECT COUNT(*) n FROM tasks WHERE status!='done' AND due_date IS NOT NULL AND due_date<date('now')`).get().n;
+function dashboard(user) {
+  const scope=user.role==='specialist'?' AND (p.manager_id=? OR EXISTS (SELECT 1 FROM tasks at WHERE at.project_id=p.id AND at.assignee_id=?))':'';
+  const params=user.role==='specialist'?[user.id,user.id]:[];
+  const counts=db.prepare(`SELECT COUNT(*) total, SUM(stage IN ('launched','management')) active, SUM(risk IN ('high','stop')) risks, SUM(acceptance_status!='accepted') handoffs,
+    SUM(next_report IS NULL OR next_report<date('now')) reports_due, SUM(next_client_contact IS NOT NULL AND next_client_contact<=date('now')) contacts_due,
+    SUM(trim(COALESCE(next_action,''))='') without_action FROM projects p WHERE archived=0 AND stage!='lead'${scope}`).get(...params);
+  const overdue=db.prepare(`SELECT COUNT(*) n FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.status!='done' AND t.due_date IS NOT NULL AND t.due_date<date('now') AND p.archived=0 AND p.stage!='lead'${scope}`).get(...params).n;
   const projects=db.prepare(`SELECT p.id,p.client,p.service,p.stage,p.acceptance_status,p.launch_deadline,p.next_action,p.next_action_due,p.next_report,p.risk,m.name manager_name,
     (SELECT COUNT(*) FROM handoff_items h WHERE h.project_id=p.id AND h.required=1 AND h.status!='accepted') handoff_open,
     (SELECT COUNT(*) FROM launch_items l WHERE l.project_id=p.id AND l.required=1 AND l.status NOT IN ('done','na')) launch_open,
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id AND t.status!='done') open_tasks,
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id AND t.status!='done' AND (t.status='blocked' OR t.priority IN ('high','urgent') OR (t.due_date IS NOT NULL AND t.due_date<=date('now','+2 day')))) urgent_tasks,
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id AND t.status!='done' AND t.due_date<date('now')) overdue,
-    (SELECT MIN(t.due_date) FROM tasks t WHERE t.project_id=p.id AND t.status!='done' AND t.due_date IS NOT NULL) next_task_due
-    FROM projects p LEFT JOIN users m ON m.id=p.manager_id WHERE p.archived=0 ORDER BY CASE p.risk WHEN 'stop' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,p.updated_at DESC`).all();
+    (SELECT MIN(t.due_date) FROM tasks t WHERE t.project_id=p.id AND t.status!='done' AND t.due_date IS NOT NULL) next_task_due,
+    (SELECT MAX(r.created_at) FROM reports r WHERE r.project_id=p.id) last_report_at,
+    (SELECT COUNT(*) FROM escalations e WHERE e.project_id=p.id AND e.status='open') open_escalations
+    FROM projects p LEFT JOIN users m ON m.id=p.manager_id WHERE p.archived=0 AND p.stage!='lead'${scope}
+    ORDER BY CASE WHEN p.risk='stop' THEN 0 WHEN p.risk='high' THEN 1 WHEN EXISTS(SELECT 1 FROM tasks ot WHERE ot.project_id=p.id AND ot.status!='done' AND ot.due_date<date('now')) THEN 2 WHEN p.next_report IS NULL OR p.next_report<date('now') THEN 3 ELSE 4 END,p.updated_at DESC`).all(...params);
   return {counts:{...counts,overdue},projects};
+}
+
+function salesDashboard() {
+  const leads=db.prepare(`SELECT l.*,u.name owner_name,
+    (SELECT MAX(a.occurred_at) FROM lead_activities a WHERE a.lead_id=l.id) activity_at,
+    (SELECT COUNT(*) FROM lead_activities a WHERE a.lead_id=l.id) activity_count
+    FROM leads l LEFT JOIN users u ON u.id=l.owner_id ORDER BY
+    CASE WHEN l.stage NOT IN ('won','lost') AND l.next_action_due IS NOT NULL AND l.next_action_due<date('now') THEN 0
+         WHEN l.stage='new' THEN 1 WHEN l.stage='qualified' THEN 2 ELSE 3 END,l.updated_at DESC`).all();
+  const counts=db.prepare(`SELECT COUNT(*) total,
+    SUM(stage NOT IN ('won','lost')) active, SUM(stage='new') new_count, SUM(qualification='qualified' AND stage NOT IN ('won','lost')) qualified,
+    SUM(stage='won') won, SUM(stage='lost') lost,
+    SUM(stage NOT IN ('won','lost') AND next_action_due IS NOT NULL AND next_action_due<date('now')) overdue,
+    SUM(stage NOT IN ('won','lost') AND trim(COALESCE(next_action,''))='') without_action
+    FROM leads`).get();
+  return {counts,leads};
+}
+
+function leadCard(id) {
+  const lead=db.prepare('SELECT l.*,u.name owner_name FROM leads l LEFT JOIN users u ON u.id=l.owner_id WHERE l.id=?').get(id);
+  if(!lead) return null;
+  const activities=db.prepare('SELECT a.*,u.name user_name FROM lead_activities a LEFT JOIN users u ON u.id=a.user_id WHERE a.lead_id=? ORDER BY a.occurred_at DESC,a.id DESC').all(id);
+  return {lead,activities};
 }
 
 async function api(req,res,path) {
@@ -201,7 +279,7 @@ async function api(req,res,path) {
     if(!secureEqual(supplied,INTEGRATION_TOKEN)) return json(res,401,{error:'Неверный токен интеграции'});
     const owner=db.prepare("SELECT id,name,role,login,must_change FROM users WHERE role='owner' AND active=1 ORDER BY id LIMIT 1").get();
     if(!owner) return json(res,409,{error:'Не найден активный собственник'});
-    const result=intakeCall(await body(req),owner); return json(res,result.project_created?201:200,result);
+    const result=intakeCall(await body(req),owner); return json(res,result.project_created||result.lead_created?201:200,result);
   }
   if(req.method==='POST' && path==='/api/login') {
     const input=await body(req); const u=db.prepare('SELECT * FROM users WHERE login=? AND active=1').get(String(input.login||''));
@@ -214,14 +292,27 @@ async function api(req,res,path) {
   if(req.method==='POST' && path==='/api/logout') { const t=cookies(req)[COOKIE_NAME]; if(t) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(tokenHash(t)); return json(res,200,{ok:true},{'set-cookie':`${COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`}); }
   if(req.method==='POST' && path==='/api/change-password') { const x=await body(req); if(String(x.password||'').length<10) return json(res,400,{error:'Пароль должен быть не короче 10 символов'}); db.prepare('UPDATE users SET password_hash=?,must_change=0 WHERE id=?').run(passwordHash(x.password),user.id); db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash!=?').run(user.id,tokenHash(cookies(req)[COOKIE_NAME])); return json(res,200,{ok:true}); }
   if(req.method==='GET' && path==='/api/users') return json(res,200,db.prepare('SELECT id,name,role,login FROM users WHERE active=1 ORDER BY id').all());
-  if(req.method==='GET' && path==='/api/dashboard') return json(res,200,dashboard());
-  if(req.method==='GET' && path==='/api/projects') return json(res,200,dashboard().projects);
-  if(req.method==='POST' && path==='/api/projects') { const input=await body(req); const id=createProject(input,user); return json(res,201,{id}); }
-  if(req.method==='POST' && path==='/api/calls/intake') { const result=intakeCall(await body(req),user); return json(res,result.project_created?201:200,result); }
+  if(req.method==='GET' && path==='/api/dashboard') return json(res,200,dashboard(user));
+  if(req.method==='GET' && path==='/api/projects') return json(res,200,dashboard(user).projects);
+  if(req.method==='POST' && path==='/api/projects') { if(user.role==='specialist')return json(res,403,{error:'Недостаточно прав'}); const input=await body(req); if(['lead','sold'].includes(input.stage))input.stage='handoff'; const id=createProject(input,user); return json(res,201,{id}); }
+  if(req.method==='POST' && path==='/api/calls/intake') { if(!canSeeSales(user))return json(res,403,{error:'Раздел продаж доступен только собственнику'}); const result=intakeCall(await body(req),user); return json(res,result.lead_created||result.project_created?201:200,result); }
+  if(path.startsWith('/api/sales') || path.startsWith('/api/leads')) {
+    if(!canSeeSales(user)) return json(res,403,{error:'Раздел продаж доступен только собственнику'});
+    if(req.method==='GET' && path==='/api/sales/dashboard') return json(res,200,salesDashboard());
+    if(req.method==='POST' && path==='/api/leads') { const id=createLead(await body(req),user); return json(res,201,{id}); }
+    let lm=route('/api/leads/:id/activities',path);
+    if(lm && req.method==='POST') { const x=await body(req),id=Number(lm.id); if(!db.prepare('SELECT id FROM leads WHERE id=?').get(id))return json(res,404,{error:'Лид не найден'}); if(!String(x.summary||'').trim())return json(res,400,{error:'Опишите контакт или результат'}); db.prepare('INSERT INTO lead_activities(lead_id,user_id,type,summary,occurred_at) VALUES(?,?,?,?,COALESCE(?,CURRENT_TIMESTAMP))').run(id,user.id,x.type||'note',String(x.summary).trim(),x.occurred_at||null); db.prepare('UPDATE leads SET last_contact_at=CASE WHEN ? IN (\'call\',\'meeting\',\'message\') THEN COALESCE(?,CURRENT_TIMESTAMP) ELSE last_contact_at END,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(x.type||'note',x.occurred_at||null,id); return json(res,201,{ok:true}); }
+    lm=route('/api/leads/:id/convert',path);
+    if(lm && req.method==='POST') { const id=Number(lm.id),x=await body(req),l=db.prepare('SELECT * FROM leads WHERE id=?').get(id); if(!l)return json(res,404,{error:'Лид не найден'}); if(l.converted_project_id)return json(res,409,{error:'Лид уже передан в производство'}); const pid=createProject({client:l.company,service:l.service||'Уточнить',sale_date:new Date().toISOString().slice(0,10),manager_id:x.manager_id||null,stage:'handoff',launch_deadline:x.launch_deadline||null,next_action:'Принять передачу и проверить вводные',call_summary:[l.need,l.notes].filter(Boolean).join('\n')},user); db.prepare("UPDATE leads SET stage='won',qualification='qualified',converted_project_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(pid,id); db.prepare('INSERT INTO lead_activities(lead_id,user_id,type,summary) VALUES(?,?,?,?)').run(id,user.id,'conversion',`Продажа состоялась, создан проект #${pid}`); return json(res,201,{project_id:pid}); }
+    lm=route('/api/leads/:id',path);
+    if(lm && req.method==='GET') { const card=leadCard(Number(lm.id)); return card?json(res,200,card):json(res,404,{error:'Лид не найден'}); }
+    if(lm && req.method==='PATCH') { const id=Number(lm.id),current=db.prepare('SELECT * FROM leads WHERE id=?').get(id); if(!current)return json(res,404,{error:'Лид не найден'}); const x=await body(req),allowed=['company','contact_name','phone','email','website','source','service','lead_date','stage','qualification','owner_id','budget','need','deadline','decision_maker','next_action','next_action_due','last_contact_at','loss_reason','notes']; const e=Object.entries(x).filter(([k])=>allowed.includes(k)); if(!e.length)return json(res,400,{error:'Нет допустимых полей'}); db.prepare(`UPDATE leads SET ${e.map(([k])=>`${k}=?`).join(',')},updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(...e.map(([,v])=>v||null),id); if(x.stage&&x.stage!==current.stage)db.prepare('INSERT INTO lead_activities(lead_id,user_id,type,summary) VALUES(?,?,?,?)').run(id,user.id,'stage',`Этап: ${current.stage} → ${x.stage}`); return json(res,200,{ok:true}); }
+    return json(res,404,{error:'Метод продаж не найден'});
+  }
   let m=route('/api/projects/:id',path);
-  if(m && req.method==='GET') { const p=projectAccess(Number(m.id)); if(!p)return json(res,404,{error:'Проект не найден'}); return json(res,200,p); }
+  if(m && req.method==='GET') { const p=projectAccess(Number(m.id),user); if(!p)return json(res,404,{error:'Проект не найден'}); return json(res,200,p); }
   if(m && req.method==='PATCH') {
-    const id=Number(m.id), input=await body(req), p=projectAccess(id); if(!p)return json(res,404,{error:'Проект не найден'});
+    const id=Number(m.id), input=await body(req), p=projectAccess(id,user); if(!p)return json(res,404,{error:'Проект не найден'});
     const allowed=['client','service','sale_date','handoff_date','manager_id','stage','acceptance_status','launch_deadline','next_action','next_action_due','next_client_contact','next_report','risk','materials_url','call_summary'];
     if(input.acceptance_status==='accepted') { const open=db.prepare("SELECT COUNT(*) n FROM handoff_items WHERE project_id=? AND required=1 AND status!='accepted'").get(id).n; if(open) return json(res,409,{error:`Передача не может быть принята: незакрытых пунктов — ${open}`}); }
     if(input.stage==='launched' || input.stage==='management') { const open=db.prepare("SELECT COUNT(*) n FROM launch_items WHERE project_id=? AND required=1 AND status NOT IN ('done','na')").get(id).n; if(open) return json(res,409,{error:`Запуск запрещён: незакрытых проверок — ${open}`}); }
@@ -230,23 +321,23 @@ async function api(req,res,path) {
     activity(id,user.id,'Обновлён проект',entries.map(([k])=>k).join(', ')); return json(res,200,{ok:true});
   }
   m=route('/api/projects/:id/all',path);
-  if(m && req.method==='GET') { const id=Number(m.id),p=projectAccess(id); if(!p)return json(res,404,{error:'Проект не найден'}); return json(res,200,{project:p,handoff:db.prepare('SELECT * FROM handoff_items WHERE project_id=? ORDER BY id').all(id),launch:db.prepare('SELECT * FROM launch_items WHERE project_id=? ORDER BY id').all(id),tasks:db.prepare(`SELECT t.*,u.name assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_id WHERE t.project_id=? ORDER BY CASE t.status WHEN 'blocked' THEN 0 WHEN 'doing' THEN 1 ELSE 2 END,t.due_date`).all(id),reports:db.prepare('SELECT r.*,u.name author_name FROM reports r LEFT JOIN users u ON u.id=r.created_by WHERE r.project_id=? ORDER BY r.created_at DESC').all(id),escalations:db.prepare('SELECT e.*,u.name author_name FROM escalations e LEFT JOIN users u ON u.id=e.created_by WHERE e.project_id=? ORDER BY e.created_at DESC').all(id),calls:db.prepare('SELECT c.*,u.name author_name FROM call_records c LEFT JOIN users u ON u.id=c.created_by WHERE c.project_id=? ORDER BY COALESCE(c.occurred_at,c.created_at) DESC,c.id DESC').all(id),activity:db.prepare('SELECT a.*,u.name user_name FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE a.project_id=? ORDER BY a.created_at DESC LIMIT 60').all(id)}); }
+  if(m && req.method==='GET') { const id=Number(m.id),p=projectAccess(id,user); if(!p)return json(res,404,{error:'Проект не найден'}); return json(res,200,{project:p,handoff:db.prepare('SELECT * FROM handoff_items WHERE project_id=? ORDER BY id').all(id),launch:db.prepare('SELECT * FROM launch_items WHERE project_id=? ORDER BY id').all(id),tasks:db.prepare(`SELECT t.*,u.name assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_id WHERE t.project_id=? ORDER BY CASE t.status WHEN 'blocked' THEN 0 WHEN 'doing' THEN 1 ELSE 2 END,t.due_date`).all(id),reports:db.prepare('SELECT r.*,u.name author_name FROM reports r LEFT JOIN users u ON u.id=r.created_by WHERE r.project_id=? ORDER BY r.created_at DESC').all(id),escalations:db.prepare('SELECT e.*,u.name author_name FROM escalations e LEFT JOIN users u ON u.id=e.created_by WHERE e.project_id=? ORDER BY e.created_at DESC').all(id),calls:db.prepare('SELECT c.*,u.name author_name FROM call_records c LEFT JOIN users u ON u.id=c.created_by WHERE c.project_id=? ORDER BY COALESCE(c.occurred_at,c.created_at) DESC,c.id DESC').all(id),activity:db.prepare('SELECT a.*,u.name user_name FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE a.project_id=? ORDER BY a.created_at DESC LIMIT 60').all(id)}); }
   m=route('/api/projects/:pid/calls',path);
-  if(m && req.method==='POST') { const pid=Number(m.pid),p=projectAccess(pid); if(!p)return json(res,404,{error:'Проект не найден'}); const result=addCallRecord(pid,await body(req),user); return json(res,result.duplicate?200:201,result); }
+  if(m && req.method==='POST') { const pid=Number(m.pid),p=projectAccess(pid,user); if(!p)return json(res,404,{error:'Проект не найден'}); const result=addCallRecord(pid,await body(req),user); return json(res,result.duplicate?200:201,result); }
   m=route('/api/projects/:pid/handoff/:id',path);
-  if(m && req.method==='PATCH') { const x=await body(req), pid=Number(m.pid), id=Number(m.id); if(x.status==='accepted' && (!String(x.value||'').trim() || !String(x.proof||'').trim())) return json(res,409,{error:'Для принятия заполните значение и доказательство/ссылку'}); db.prepare('UPDATE handoff_items SET value=?,status=?,comment=?,proof=?,updated_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?').run(x.value||'',x.status||'missing',x.comment||'',x.proof||'',user.id,id,pid); activity(pid,user.id,'Обновлена передача',`Пункт #${id}: ${x.status}`); return json(res,200,{ok:true}); }
+  if(m && req.method==='PATCH') { const x=await body(req), pid=Number(m.pid), id=Number(m.id); if(!projectAccess(pid,user))return json(res,404,{error:'Проект не найден'}); if(x.status==='accepted' && (!String(x.value||'').trim() || !String(x.proof||'').trim())) return json(res,409,{error:'Для принятия заполните значение и доказательство/ссылку'}); db.prepare('UPDATE handoff_items SET value=?,status=?,comment=?,proof=?,updated_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?').run(x.value||'',x.status||'missing',x.comment||'',x.proof||'',user.id,id,pid); activity(pid,user.id,'Обновлена передача',`Пункт #${id}: ${x.status}`); return json(res,200,{ok:true}); }
   m=route('/api/projects/:pid/launch/:id',path);
-  if(m && req.method==='PATCH') { const x=await body(req),pid=Number(m.pid),id=Number(m.id); if(x.status==='done' && !String(x.proof||'').trim()) return json(res,409,{error:'Готово требует доказательство: ссылку, ID, дату или цифру'}); db.prepare("UPDATE launch_items SET status=?,proof=?,due_date=?,checked_by=CASE WHEN ?='done' THEN ? ELSE checked_by END,checked_at=CASE WHEN ?='done' THEN CURRENT_TIMESTAMP ELSE checked_at END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?").run(x.status||'todo',x.proof||'',x.due_date||null,x.status,user.id,x.status,id,pid); activity(pid,user.id,'Обновлена проверка запуска',`Пункт #${id}: ${x.status}`); return json(res,200,{ok:true}); }
+  if(m && req.method==='PATCH') { const x=await body(req),pid=Number(m.pid),id=Number(m.id); if(!projectAccess(pid,user))return json(res,404,{error:'Проект не найден'}); if(x.status==='done' && !String(x.proof||'').trim()) return json(res,409,{error:'Готово требует доказательство: ссылку, ID, дату или цифру'}); db.prepare("UPDATE launch_items SET status=?,proof=?,due_date=?,checked_by=CASE WHEN ?='done' THEN ? ELSE checked_by END,checked_at=CASE WHEN ?='done' THEN CURRENT_TIMESTAMP ELSE checked_at END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?").run(x.status||'todo',x.proof||'',x.due_date||null,x.status,user.id,x.status,id,pid); activity(pid,user.id,'Обновлена проверка запуска',`Пункт #${id}: ${x.status}`); return json(res,200,{ok:true}); }
   m=route('/api/projects/:pid/tasks',path);
-  if(m && req.method==='POST') { const x=await body(req),pid=Number(m.pid); if(!String(x.title||'').trim())return json(res,400,{error:'Укажите задачу'}); const r=db.prepare('INSERT INTO tasks(project_id,title,description,assignee_id,status,priority,due_date,created_by) VALUES(?,?,?,?,?,?,?,?)').run(pid,x.title.trim(),x.description||'',x.assignee_id||null,x.status||'backlog',x.priority||'normal',x.due_date||null,user.id); activity(pid,user.id,'Создана задача',x.title); return json(res,201,{id:Number(r.lastInsertRowid)}); }
+  if(m && req.method==='POST') { const x=await body(req),pid=Number(m.pid); if(!projectAccess(pid,user))return json(res,404,{error:'Проект не найден'}); if(!String(x.title||'').trim())return json(res,400,{error:'Укажите задачу'}); const r=db.prepare('INSERT INTO tasks(project_id,title,description,assignee_id,status,priority,due_date,created_by) VALUES(?,?,?,?,?,?,?,?)').run(pid,x.title.trim(),x.description||'',x.assignee_id||null,x.status||'backlog',x.priority||'normal',x.due_date||null,user.id); activity(pid,user.id,'Создана задача',x.title); return json(res,201,{id:Number(r.lastInsertRowid)}); }
   m=route('/api/tasks/:id',path);
-  if(m && req.method==='PATCH') { const x=await body(req),id=Number(m.id),t=db.prepare('SELECT * FROM tasks WHERE id=?').get(id); if(!t)return json(res,404,{error:'Задача не найдена'}); const allowed=['title','description','assignee_id','status','priority','due_date','proof']; const e=Object.entries(x).filter(([k])=>allowed.includes(k)); db.prepare(`UPDATE tasks SET ${e.map(([k])=>`${k}=?`).join(',')},updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(...e.map(([,v])=>v||null),id); activity(t.project_id,user.id,'Обновлена задача',`${t.title}: ${x.status||'изменена'}`); return json(res,200,{ok:true}); }
+  if(m && req.method==='PATCH') { const x=await body(req),id=Number(m.id),t=db.prepare('SELECT * FROM tasks WHERE id=?').get(id); if(!t||!projectAccess(t.project_id,user))return json(res,404,{error:'Задача не найдена'}); const allowed=['title','description','assignee_id','status','priority','due_date','proof']; const e=Object.entries(x).filter(([k])=>allowed.includes(k)); db.prepare(`UPDATE tasks SET ${e.map(([k])=>`${k}=?`).join(',')},updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(...e.map(([,v])=>v||null),id); activity(t.project_id,user.id,'Обновлена задача',`${t.title}: ${x.status||'изменена'}`); return json(res,200,{ok:true}); }
   m=route('/api/projects/:pid/reports',path);
-  if(m && req.method==='POST') { const x=await body(req),pid=Number(m.pid); for(const k of ['period','planned','completed','metrics','next_steps']) if(!String(x[k]||'').trim())return json(res,400,{error:`Заполните обязательное поле: ${k}`}); const r=db.prepare('INSERT INTO reports(project_id,period,planned,completed,metrics,deviation,reason,next_steps,risk,client_message,report_url,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(pid,x.period,x.planned,x.completed,x.metrics,x.deviation||'',x.reason||'',x.next_steps,x.risk||'none',x.client_message||'',x.report_url||'',user.id); db.prepare('UPDATE projects SET next_report=?,risk=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(x.next_report||null,x.risk||'none',pid); activity(pid,user.id,'Добавлен недельный отчёт',x.period); return json(res,201,{id:Number(r.lastInsertRowid)}); }
+  if(m && req.method==='POST') { const x=await body(req),pid=Number(m.pid); if(!projectAccess(pid,user))return json(res,404,{error:'Проект не найден'}); for(const k of ['period','planned','completed','metrics','next_steps']) if(!String(x[k]||'').trim())return json(res,400,{error:`Заполните обязательное поле: ${k}`}); const r=db.prepare('INSERT INTO reports(project_id,period,planned,completed,metrics,deviation,reason,next_steps,risk,client_message,report_url,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(pid,x.period,x.planned,x.completed,x.metrics,x.deviation||'',x.reason||'',x.next_steps,x.risk||'none',x.client_message||'',x.report_url||'',user.id); db.prepare('UPDATE projects SET next_report=?,risk=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(x.next_report||null,x.risk||'none',pid); activity(pid,user.id,'Добавлен недельный отчёт',x.period); return json(res,201,{id:Number(r.lastInsertRowid)}); }
   m=route('/api/projects/:pid/escalations',path);
-  if(m && req.method==='POST') { const x=await body(req),pid=Number(m.pid); for(const k of ['type','facts','impact','option_a','option_b','recommendation']) if(!String(x[k]||'').trim())return json(res,400,{error:'Эскалация должна содержать факты, влияние, 2 варианта и рекомендацию'}); const r=db.prepare('INSERT INTO escalations(project_id,type,facts,impact,option_a,option_b,recommendation,created_by) VALUES(?,?,?,?,?,?,?,?)').run(pid,x.type,x.facts,x.impact,x.option_a,x.option_b,x.recommendation,user.id); db.prepare("UPDATE projects SET risk='high',updated_at=CURRENT_TIMESTAMP WHERE id=? AND risk!='stop'").run(pid); activity(pid,user.id,'Создана эскалация',x.type); return json(res,201,{id:Number(r.lastInsertRowid)}); }
+  if(m && req.method==='POST') { const x=await body(req),pid=Number(m.pid); if(!projectAccess(pid,user))return json(res,404,{error:'Проект не найден'}); for(const k of ['type','facts','impact','option_a','option_b','recommendation']) if(!String(x[k]||'').trim())return json(res,400,{error:'Эскалация должна содержать факты, влияние, 2 варианта и рекомендацию'}); const r=db.prepare('INSERT INTO escalations(project_id,type,facts,impact,option_a,option_b,recommendation,created_by) VALUES(?,?,?,?,?,?,?,?)').run(pid,x.type,x.facts,x.impact,x.option_a,x.option_b,x.recommendation,user.id); db.prepare("UPDATE projects SET risk='high',updated_at=CURRENT_TIMESTAMP WHERE id=? AND risk!='stop'").run(pid); activity(pid,user.id,'Создана эскалация',x.type); return json(res,201,{id:Number(r.lastInsertRowid)}); }
   m=route('/api/escalations/:id',path);
-  if(m && req.method==='PATCH') { const id=Number(m.id),e=db.prepare('SELECT * FROM escalations WHERE id=?').get(id); if(!e)return json(res,404,{error:'Эскалация не найдена'}); const x=await body(req); const status=x.status==='resolved'?'resolved':'open'; db.prepare("UPDATE escalations SET status=?,resolved_at=CASE WHEN ?='resolved' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?").run(status,status,id); activity(e.project_id,user.id,status==='resolved'?'Закрыта эскалация':'Открыта эскалация',e.type); return json(res,200,{ok:true}); }
+  if(m && req.method==='PATCH') { const id=Number(m.id),e=db.prepare('SELECT * FROM escalations WHERE id=?').get(id); if(!e||!projectAccess(e.project_id,user))return json(res,404,{error:'Эскалация не найдена'}); const x=await body(req); const status=x.status==='resolved'?'resolved':'open'; db.prepare("UPDATE escalations SET status=?,resolved_at=CASE WHEN ?='resolved' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?").run(status,status,id); activity(e.project_id,user.id,status==='resolved'?'Закрыта эскалация':'Открыта эскалация',e.type); return json(res,200,{ok:true}); }
   return json(res,404,{error:'Метод не найден'});
 }
 
