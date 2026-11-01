@@ -3,12 +3,15 @@ import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
+import { extractProjectName, normalizeProjectName } from './lib/call-intake.mjs';
 
 const PORT = Number(process.env.PORT || 8790);
 const DATA_DIR = process.env.DATA_DIR || join(process.cwd(), 'data');
 const PUBLIC_DIR = join(process.cwd(), 'public');
 const COOKIE_NAME = 'agency_ops_session';
 const SESSION_TTL = 30 * 86400;
+const INTEGRATION_TOKEN = process.env.INTEGRATION_TOKEN || '';
+const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 5_000_000);
 mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(join(DATA_DIR, 'agency-ops.sqlite'));
 db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
@@ -68,10 +71,17 @@ CREATE TABLE IF NOT EXISTS activity (
   user_id INTEGER REFERENCES users(id), action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS call_records (
+  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source TEXT NOT NULL DEFAULT 'manual', external_id TEXT UNIQUE, title TEXT NOT NULL DEFAULT '',
+  transcript TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', trigger_phrase TEXT NOT NULL DEFAULT '',
+  occurred_at TEXT, created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_handoff_project ON handoff_items(project_id);
 CREATE INDEX IF NOT EXISTS idx_launch_project ON launch_items(project_id);
 CREATE INDEX IF NOT EXISTS idx_activity_project ON activity(project_id);
+CREATE INDEX IF NOT EXISTS idx_calls_project ON call_records(project_id);
 `);
 
 const handoffTemplate = [
@@ -110,7 +120,7 @@ seedUser('Лиза','manager','liza',process.env.INIT_LIZA_PASSWORD);
 
 const json = (res,status,body,headers={}) => { res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store',...headers}); res.end(JSON.stringify(body)); };
 const text = (res,status,body,type='text/plain; charset=utf-8') => { res.writeHead(status,{'content-type':type,'cache-control':'no-store'}); res.end(body); };
-async function body(req) { let size=0, chunks=[]; for await (const c of req) { size+=c.length; if(size>1_000_000) throw new Error('Слишком большой запрос'); chunks.push(c); } return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}'); }
+async function body(req) { let size=0, chunks=[]; for await (const c of req) { size+=c.length; if(size>MAX_BODY_BYTES) throw new Error('Слишком большой запрос'); chunks.push(c); } return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}'); }
 function cookies(req) { return Object.fromEntries(String(req.headers.cookie||'').split(';').map(v=>v.trim().split('=').map(decodeURIComponent)).filter(v=>v.length===2)); }
 function auth(req) {
   const token=cookies(req)[COOKIE_NAME]; if(!token) return null;
@@ -119,21 +129,59 @@ function auth(req) {
 function activity(projectId,userId,action,details='') { db.prepare('INSERT INTO activity(project_id,user_id,action,details) VALUES(?,?,?,?)').run(projectId,userId,action,details); }
 function projectAccess(id) { return db.prepare(`SELECT p.*, o.name owner_name, m.name manager_name FROM projects p LEFT JOIN users o ON o.id=p.owner_id LEFT JOIN users m ON m.id=p.manager_id WHERE p.id=? AND p.archived=0`).get(id); }
 function route(pattern,path) { const keys=[]; const re=new RegExp('^'+pattern.replace(/:([A-Za-z]+)/g,(_,k)=>(keys.push(k),'([^/]+)'))+'$'); const m=path.match(re); return m?Object.fromEntries(keys.map((k,i)=>[k,decodeURIComponent(m[i+1])])):null; }
+function secureEqual(a,b) { const aa=Buffer.from(String(a||'')),bb=Buffer.from(String(b||'')); return aa.length===bb.length && timingSafeEqual(aa,bb); }
+function findProjectByName(name) { const key=normalizeProjectName(name); return db.prepare('SELECT id,client FROM projects WHERE archived=0 ORDER BY updated_at DESC').all().find(p=>normalizeProjectName(p.client)===key)||null; }
 
 function createProject(input,user) {
-  if(!String(input.client||'').trim() || !String(input.service||'').trim()) throw new Error('Укажите клиента и услугу');
+  if(!String(input.client||'').trim()) throw new Error('Укажите клиента');
+  const service=String(input.service||'').trim()||'Уточнить после созвона';
   const publicToken=randomBytes(18).toString('base64url');
-  const r=db.prepare(`INSERT INTO projects(client,service,sale_date,owner_id,manager_id,launch_deadline,next_action,next_action_due,next_client_contact,next_report,risk,materials_url,call_summary,public_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-    String(input.client).trim(),String(input.service).trim(),input.sale_date||null,user.id,input.manager_id||null,input.launch_deadline||null,input.next_action||'',input.next_action_due||null,input.next_client_contact||null,input.next_report||null,input.risk||'none',input.materials_url||'',input.call_summary||'',publicToken);
+  const r=db.prepare(`INSERT INTO projects(client,service,sale_date,owner_id,manager_id,stage,launch_deadline,next_action,next_action_due,next_client_contact,next_report,risk,materials_url,call_summary,public_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    String(input.client).trim(),service,input.sale_date||null,user.id,input.manager_id||null,input.stage||'sold',input.launch_deadline||null,input.next_action||'',input.next_action_due||null,input.next_client_contact||null,input.next_report||null,input.risk||'none',input.materials_url||'',input.call_summary||'',publicToken);
   const pid=Number(r.lastInsertRowid);
   const h=db.prepare('INSERT INTO handoff_items(project_id,section,label,hint) VALUES(?,?,?,?)');
   const l=db.prepare('INSERT INTO launch_items(project_id,stage,label,criterion,assignee) VALUES(?,?,?,?,?)');
   db.exec('BEGIN'); try { for(const x of handoffTemplate) h.run(pid,...x); for(const x of launchTemplate) l.run(pid,...x); db.exec('COMMIT'); } catch(e){db.exec('ROLLBACK');throw e;}
-  activity(pid,user.id,'Создан проект',`${input.client} — ${input.service}`); return pid;
+  activity(pid,user.id,input.stage==='lead'?'Создан лид':'Создан проект',`${input.client} — ${service}`); return pid;
+}
+
+function addCallRecord(projectId,input,user) {
+  const externalId=String(input.external_id||'').trim()||null;
+  if(externalId) {
+    const duplicate=db.prepare('SELECT id,project_id FROM call_records WHERE external_id=?').get(externalId);
+    if(duplicate) return {id:duplicate.id,project_id:duplicate.project_id,duplicate:true};
+  }
+  const summary=String(input.summary||'').trim();
+  const transcript=String(input.transcript||'').trim();
+  if(!summary && !transcript) throw new Error('Добавьте сводку или расшифровку созвона');
+  const result=db.prepare(`INSERT INTO call_records(project_id,source,external_id,title,transcript,summary,trigger_phrase,occurred_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+    projectId,String(input.source||'manual').trim()||'manual',externalId,String(input.title||'').trim(),transcript,summary,String(input.trigger_phrase||'').trim(),input.occurred_at||null,user?.id||null);
+  if(summary) db.prepare(`UPDATE projects SET call_summary=CASE WHEN trim(call_summary)='' THEN ? ELSE call_summary END,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(summary,projectId);
+  else db.prepare('UPDATE projects SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(projectId);
+  activity(projectId,user?.id||null,'Добавлен созвон',summary||String(input.title||'Без названия'));
+  return {id:Number(result.lastInsertRowid),project_id:projectId,duplicate:false};
+}
+
+function intakeCall(input,user) {
+  const externalId=String(input.external_id||'').trim();
+  if(externalId) {
+    const duplicate=db.prepare(`SELECT c.id,c.project_id,p.client project_name FROM call_records c JOIN projects p ON p.id=c.project_id WHERE c.external_id=?`).get(externalId);
+    if(duplicate) return {project_id:duplicate.project_id,project_name:duplicate.project_name,project_created:false,id:duplicate.id,duplicate:true};
+  }
+  const projectName=extractProjectName(input);
+  if(!projectName) throw new Error('В конце расшифровки нужна отдельная фраза «Проект <название>»');
+  let project=findProjectByName(projectName),created=false;
+  if(!project) {
+    const manager=db.prepare("SELECT id FROM users WHERE role='manager' AND active=1 ORDER BY id LIMIT 1").get();
+    const projectId=createProject({client:projectName,service:input.service||'',stage:'lead',manager_id:manager?.id||null,next_action:'Уточнить вводные после созвона',call_summary:input.summary||''},user);
+    project={id:projectId,client:projectName}; created=true;
+  }
+  const call=addCallRecord(project.id,{...input,trigger_phrase:`Проект ${projectName}`},user);
+  return {project_id:project.id,project_name:project.client,project_created:created,...call};
 }
 
 function dashboard() {
-  const counts=db.prepare(`SELECT COUNT(*) total, SUM(stage='launched' OR stage='management') active, SUM(risk IN ('high','stop')) risks, SUM(acceptance_status!='accepted') handoffs FROM projects WHERE archived=0`).get();
+  const counts=db.prepare(`SELECT COUNT(*) total, SUM(stage='lead') leads, SUM(stage='launched' OR stage='management') active, SUM(risk IN ('high','stop')) risks, SUM(acceptance_status!='accepted') handoffs FROM projects WHERE archived=0`).get();
   const overdue=db.prepare(`SELECT COUNT(*) n FROM tasks WHERE status!='done' AND due_date IS NOT NULL AND due_date<date('now')`).get().n;
   const projects=db.prepare(`SELECT p.id,p.client,p.service,p.stage,p.acceptance_status,p.launch_deadline,p.next_action,p.next_action_due,p.next_report,p.risk,m.name manager_name,
     (SELECT COUNT(*) FROM handoff_items h WHERE h.project_id=p.id AND h.required=1 AND h.status!='accepted') handoff_open,
@@ -144,6 +192,14 @@ function dashboard() {
 }
 
 async function api(req,res,path) {
+  if(req.method==='POST' && path==='/api/integrations/calls') {
+    if(!INTEGRATION_TOKEN) return json(res,503,{error:'Интеграция созвонов пока не подключена'});
+    const supplied=String(req.headers.authorization||'').replace(/^Bearer\s+/i,'');
+    if(!secureEqual(supplied,INTEGRATION_TOKEN)) return json(res,401,{error:'Неверный токен интеграции'});
+    const owner=db.prepare("SELECT id,name,role,login,must_change FROM users WHERE role='owner' AND active=1 ORDER BY id LIMIT 1").get();
+    if(!owner) return json(res,409,{error:'Не найден активный собственник'});
+    const result=intakeCall(await body(req),owner); return json(res,result.project_created?201:200,result);
+  }
   if(req.method==='POST' && path==='/api/login') {
     const input=await body(req); const u=db.prepare('SELECT * FROM users WHERE login=? AND active=1').get(String(input.login||''));
     if(!u || !verifyPassword(String(input.password||''),u.password_hash)) return json(res,401,{error:'Неверный логин или пароль'});
@@ -158,6 +214,7 @@ async function api(req,res,path) {
   if(req.method==='GET' && path==='/api/dashboard') return json(res,200,dashboard());
   if(req.method==='GET' && path==='/api/projects') return json(res,200,dashboard().projects);
   if(req.method==='POST' && path==='/api/projects') { const input=await body(req); const id=createProject(input,user); return json(res,201,{id}); }
+  if(req.method==='POST' && path==='/api/calls/intake') { const result=intakeCall(await body(req),user); return json(res,result.project_created?201:200,result); }
   let m=route('/api/projects/:id',path);
   if(m && req.method==='GET') { const p=projectAccess(Number(m.id)); if(!p)return json(res,404,{error:'Проект не найден'}); return json(res,200,p); }
   if(m && req.method==='PATCH') {
@@ -170,7 +227,9 @@ async function api(req,res,path) {
     activity(id,user.id,'Обновлён проект',entries.map(([k])=>k).join(', ')); return json(res,200,{ok:true});
   }
   m=route('/api/projects/:id/all',path);
-  if(m && req.method==='GET') { const id=Number(m.id),p=projectAccess(id); if(!p)return json(res,404,{error:'Проект не найден'}); return json(res,200,{project:p,handoff:db.prepare('SELECT * FROM handoff_items WHERE project_id=? ORDER BY id').all(id),launch:db.prepare('SELECT * FROM launch_items WHERE project_id=? ORDER BY id').all(id),tasks:db.prepare(`SELECT t.*,u.name assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_id WHERE project_id=? ORDER BY CASE status WHEN 'blocked' THEN 0 WHEN 'doing' THEN 1 ELSE 2 END,due_date`).all(id),reports:db.prepare('SELECT r.*,u.name author_name FROM reports r LEFT JOIN users u ON u.id=r.created_by WHERE project_id=? ORDER BY created_at DESC').all(id),escalations:db.prepare('SELECT e.*,u.name author_name FROM escalations e LEFT JOIN users u ON u.id=e.created_by WHERE project_id=? ORDER BY created_at DESC').all(id),activity:db.prepare('SELECT a.*,u.name user_name FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created_at DESC LIMIT 60').all(id)}); }
+  if(m && req.method==='GET') { const id=Number(m.id),p=projectAccess(id); if(!p)return json(res,404,{error:'Проект не найден'}); return json(res,200,{project:p,handoff:db.prepare('SELECT * FROM handoff_items WHERE project_id=? ORDER BY id').all(id),launch:db.prepare('SELECT * FROM launch_items WHERE project_id=? ORDER BY id').all(id),tasks:db.prepare(`SELECT t.*,u.name assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_id WHERE project_id=? ORDER BY CASE status WHEN 'blocked' THEN 0 WHEN 'doing' THEN 1 ELSE 2 END,due_date`).all(id),reports:db.prepare('SELECT r.*,u.name author_name FROM reports r LEFT JOIN users u ON u.id=r.created_by WHERE project_id=? ORDER BY created_at DESC').all(id),escalations:db.prepare('SELECT e.*,u.name author_name FROM escalations e LEFT JOIN users u ON u.id=e.created_by WHERE project_id=? ORDER BY created_at DESC').all(id),calls:db.prepare('SELECT c.*,u.name author_name FROM call_records c LEFT JOIN users u ON u.id=c.created_by WHERE project_id=? ORDER BY COALESCE(occurred_at,created_at) DESC,id DESC').all(id),activity:db.prepare('SELECT a.*,u.name user_name FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created_at DESC LIMIT 60').all(id)}); }
+  m=route('/api/projects/:pid/calls',path);
+  if(m && req.method==='POST') { const pid=Number(m.pid),p=projectAccess(pid); if(!p)return json(res,404,{error:'Проект не найден'}); const result=addCallRecord(pid,await body(req),user); return json(res,result.duplicate?200:201,result); }
   m=route('/api/projects/:pid/handoff/:id',path);
   if(m && req.method==='PATCH') { const x=await body(req), pid=Number(m.pid), id=Number(m.id); if(x.status==='accepted' && (!String(x.value||'').trim() || !String(x.proof||'').trim())) return json(res,409,{error:'Для принятия заполните значение и доказательство/ссылку'}); db.prepare('UPDATE handoff_items SET value=?,status=?,comment=?,proof=?,updated_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?').run(x.value||'',x.status||'missing',x.comment||'',x.proof||'',user.id,id,pid); activity(pid,user.id,'Обновлена передача',`Пункт #${id}: ${x.status}`); return json(res,200,{ok:true}); }
   m=route('/api/projects/:pid/launch/:id',path);
