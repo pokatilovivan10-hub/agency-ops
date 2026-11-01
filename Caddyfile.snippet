@@ -1,0 +1,6 @@
+	redir /agency /agency/ 308
+	@agency path /agency/*
+	handle @agency {
+		uri strip_prefix /agency
+		reverse_proxy 127.0.0.1:8790
+	}

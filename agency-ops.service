@@ -1,0 +1,27 @@
+[Unit]
+Description=Agency Ops project operating system
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/opt/agency-ops
+Environment=PORT=8790
+Environment=DATA_DIR=/var/lib/agency-ops
+EnvironmentFile=/etc/agency-ops.env
+ExecStart=/usr/bin/node /opt/agency-ops/server.mjs
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agency-ops
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
