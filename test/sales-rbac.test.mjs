@@ -67,6 +67,23 @@ test('owner manages sales while project manager only sees production', async t =
   assert.equal(ownerSales.status, 200);
   assert.equal((await ownerSales.json()).leads[0].company, 'Тестовый клиент');
 
+  const movedLead = await fetch(`${base}/api/leads/${leadId}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json', cookie: ownerCookie },
+    body: JSON.stringify({ stage: 'meeting', qualification: 'qualified' }),
+  });
+  assert.equal(movedLead.status, 200);
+  const movedCard = await (await fetch(`${base}/api/leads/${leadId}`, { headers: { cookie: ownerCookie } })).json();
+  assert.equal(movedCard.lead.stage, 'meeting');
+  assert.equal(movedCard.activities.some(activity => activity.type === 'stage'), true);
+
+  const invalidWon = await fetch(`${base}/api/leads/${leadId}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json', cookie: ownerCookie },
+    body: JSON.stringify({ stage: 'won' }),
+  });
+  assert.equal(invalidWon.status, 409);
+
   const managerSales = await fetch(`${base}/api/sales/dashboard`, { headers: { cookie: managerCookie } });
   assert.equal(managerSales.status, 403);
 
