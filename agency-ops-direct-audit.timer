@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Agency Ops Direct audit every morning
+
+[Timer]
+OnCalendar=*-*-* 08:15:00 Europe/Moscow
+Persistent=true
+RandomizedDelaySec=300
+Unit=agency-ops-direct-audit.service
+
+[Install]
+WantedBy=timers.target

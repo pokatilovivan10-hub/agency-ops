@@ -1,0 +1,19 @@
+[Unit]
+Description=Agency Ops daily Yandex Direct audit
+After=network-online.target agency-ops.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=openclaw
+Group=openclaw
+WorkingDirectory=/opt/agency-ops
+Environment=DATA_DIR=/var/lib/agency-ops
+Environment=YANDEX_DIRECT_CREDENTIALS_FILE=/home/openclaw/.secrets/yandex-direct.json
+ExecStart=/usr/bin/node /opt/agency-ops/scripts/daily-direct-audit.mjs
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/agency-ops
+

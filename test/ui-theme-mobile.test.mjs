@@ -25,3 +25,14 @@ test('profile opens from the account block instead of a duplicate nav item', () 
   assert.match(app, /\$\('#userProfile'\)\.onclick=\(\)=>navigate\('account'\)/);
   assert.match(css, /\.user-profile\{[^}]*min-height:52px/);
 });
+
+test('project result workspace exposes KPI passport, daily audits and action log', () => {
+  assert.match(app, /\['success','Результат'\]/);
+  assert.match(app, /function successView\(/);
+  assert.match(app, /function successProfileModal\(/);
+  assert.match(app, /function dailyAuditModal\(/);
+  assert.match(app, /function optimizationModal\(/);
+  assert.match(app, /Паспорт результата/);
+  assert.match(app, /Журнал корректировок/);
+  assert.match(css, /\.action-log\{/);
+});

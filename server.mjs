@@ -96,6 +96,33 @@ CREATE TABLE IF NOT EXISTS lead_activities (
   user_id INTEGER REFERENCES users(id), type TEXT NOT NULL DEFAULT 'note', summary TEXT NOT NULL,
   occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS client_success_profiles (
+  project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  business_goal TEXT NOT NULL, primary_kpi TEXT NOT NULL, target_value TEXT NOT NULL,
+  monthly_budget TEXT NOT NULL, direct_login TEXT NOT NULL, metrika_counter_id TEXT NOT NULL,
+  crm_source TEXT NOT NULL, landing_url TEXT NOT NULL, geo TEXT NOT NULL, offer TEXT NOT NULL,
+  audience TEXT NOT NULL, restrictions TEXT NOT NULL, campaign_blueprint TEXT NOT NULL,
+  auto_actions_enabled INTEGER NOT NULL DEFAULT 0, readiness TEXT NOT NULL DEFAULT 'draft',
+  updated_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS daily_audits (
+  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  audit_date TEXT NOT NULL, source_status TEXT NOT NULL CHECK(source_status IN ('confirmed','confirmed_zero','unavailable')),
+  status TEXT NOT NULL CHECK(status IN ('ok','attention','critical','unavailable')),
+  impressions INTEGER, clicks INTEGER, spend REAL, conversions REAL, cpa REAL,
+  findings TEXT NOT NULL DEFAULT '', actions TEXT NOT NULL DEFAULT '', raw_reference TEXT NOT NULL DEFAULT '',
+  created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(project_id,audit_date)
+);
+CREATE TABLE IF NOT EXISTS optimization_actions (
+  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  action_date TEXT NOT NULL, category TEXT NOT NULL, entity TEXT NOT NULL DEFAULT '', action TEXT NOT NULL,
+  rationale TEXT NOT NULL, risk_level TEXT NOT NULL DEFAULT 'low', status TEXT NOT NULL DEFAULT 'planned',
+  before_value TEXT NOT NULL DEFAULT '', after_value TEXT NOT NULL DEFAULT '', proof TEXT NOT NULL DEFAULT '',
+  created_by INTEGER REFERENCES users(id), applied_by INTEGER REFERENCES users(id), applied_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_handoff_project ON handoff_items(project_id);
 CREATE INDEX IF NOT EXISTS idx_launch_project ON launch_items(project_id);
@@ -104,6 +131,8 @@ CREATE INDEX IF NOT EXISTS idx_calls_project ON call_records(project_id);
 CREATE INDEX IF NOT EXISTS idx_leads_stage ON leads(stage);
 CREATE INDEX IF NOT EXISTS idx_leads_owner ON leads(owner_id);
 CREATE INDEX IF NOT EXISTS idx_lead_activities_lead ON lead_activities(lead_id);
+CREATE INDEX IF NOT EXISTS idx_daily_audits_project_date ON daily_audits(project_id,audit_date DESC);
+CREATE INDEX IF NOT EXISTS idx_optimization_actions_project_date ON optimization_actions(project_id,action_date DESC);
 `);
 
 db.exec(`
@@ -161,6 +190,15 @@ function projectAccess(id,user) {
   const params = user?.role === 'specialist' ? [id,user.id,user.id] : [id];
   return db.prepare(`SELECT p.*, o.name owner_name, m.name manager_name FROM projects p LEFT JOIN users o ON o.id=p.owner_id LEFT JOIN users m ON m.id=p.manager_id WHERE p.id=? AND p.archived=0 AND p.stage!='lead'${own}`).get(...params);
 }
+function canManageProject(user) { return user?.role === 'owner' || user?.role === 'manager'; }
+const SUCCESS_PROFILE_FIELDS = ['business_goal','primary_kpi','target_value','monthly_budget','direct_login','metrika_counter_id','crm_source','landing_url','geo','offer','audience','restrictions','campaign_blueprint'];
+function successProfile(projectId) { return db.prepare('SELECT * FROM client_success_profiles WHERE project_id=?').get(projectId)||null; }
+function cleanSuccessProfile(input) {
+  const profile=Object.fromEntries(SUCCESS_PROFILE_FIELDS.map(k=>[k,String(input[k]||'').trim()]));
+  const missing=SUCCESS_PROFILE_FIELDS.filter(k=>!profile[k]);
+  return {...profile,auto_actions_enabled:String(input.auto_actions_enabled||'0')==='1'?1:0,readiness:missing.length?'draft':'ready',missing};
+}
+function numberOrNull(value) { return value==='' || value===null || value===undefined ? null : Number(value); }
 function route(pattern,path) { const keys=[]; const re=new RegExp('^'+pattern.replace(/:([A-Za-z]+)/g,(_,k)=>(keys.push(k),'([^/]+)'))+'$'); const m=path.match(re); return m?Object.fromEntries(keys.map((k,i)=>[k,decodeURIComponent(m[i+1])])):null; }
 function secureEqual(a,b) { const aa=Buffer.from(String(a||'')),bb=Buffer.from(String(b||'')); return aa.length===bb.length && timingSafeEqual(aa,bb); }
 function publicLeadCors(req) {
@@ -265,7 +303,10 @@ function dashboard(user) {
   const params=user.role==='specialist'?[user.id,user.id]:[];
   const counts=db.prepare(`SELECT COUNT(*) total, SUM(stage IN ('launched','management')) active, SUM(risk IN ('high','stop')) risks, SUM(acceptance_status!='accepted') handoffs,
     SUM(next_report IS NULL OR next_report<date('now')) reports_due, SUM(next_client_contact IS NOT NULL AND next_client_contact<=date('now')) contacts_due,
-    SUM(trim(COALESCE(next_action,''))='') without_action FROM projects p WHERE archived=0 AND stage!='lead'${scope}`).get(...params);
+    SUM(trim(COALESCE(next_action,''))='') without_action,
+    SUM(NOT EXISTS(SELECT 1 FROM client_success_profiles sp WHERE sp.project_id=p.id AND sp.readiness='ready')) without_success_profile,
+    SUM(stage IN ('launched','management') AND NOT EXISTS(SELECT 1 FROM daily_audits da WHERE da.project_id=p.id AND da.audit_date>=date('now','-1 day'))) audits_due
+    FROM projects p WHERE archived=0 AND stage!='lead'${scope}`).get(...params);
   const overdue=db.prepare(`SELECT COUNT(*) n FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.status!='done' AND t.due_date IS NOT NULL AND t.due_date<date('now') AND p.archived=0 AND p.stage!='lead'${scope}`).get(...params).n;
   const projects=db.prepare(`SELECT p.id,p.client,p.service,p.stage,p.acceptance_status,p.launch_deadline,p.next_action,p.next_action_due,p.next_report,p.risk,m.name manager_name,
     (SELECT COUNT(*) FROM handoff_items h WHERE h.project_id=p.id AND h.required=1 AND h.status!='accepted') handoff_open,
@@ -275,6 +316,9 @@ function dashboard(user) {
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id AND t.status!='done' AND t.due_date<date('now')) overdue,
     (SELECT MIN(t.due_date) FROM tasks t WHERE t.project_id=p.id AND t.status!='done' AND t.due_date IS NOT NULL) next_task_due,
     (SELECT MAX(r.created_at) FROM reports r WHERE r.project_id=p.id) last_report_at,
+    (SELECT sp.readiness FROM client_success_profiles sp WHERE sp.project_id=p.id) success_readiness,
+    (SELECT MAX(da.audit_date) FROM daily_audits da WHERE da.project_id=p.id) last_audit_date,
+    (SELECT da.status FROM daily_audits da WHERE da.project_id=p.id ORDER BY da.audit_date DESC,da.id DESC LIMIT 1) last_audit_status,
     (SELECT COUNT(*) FROM escalations e WHERE e.project_id=p.id AND e.status='open') open_escalations
     FROM projects p LEFT JOIN users m ON m.id=p.manager_id WHERE p.archived=0 AND p.stage!='lead'${scope}
     ORDER BY CASE WHEN p.risk='stop' THEN 0 WHEN p.risk='high' THEN 1 WHEN EXISTS(SELECT 1 FROM tasks ot WHERE ot.project_id=p.id AND ot.status!='done' AND ot.due_date<date('now')) THEN 2 WHEN p.next_report IS NULL OR p.next_report<date('now') THEN 3 ELSE 4 END,p.updated_at DESC`).all(...params);
@@ -357,13 +401,75 @@ async function api(req,res,path) {
     const id=Number(m.id), input=await body(req), p=projectAccess(id,user); if(!p)return json(res,404,{error:'Проект не найден'});
     const allowed=['client','service','sale_date','handoff_date','manager_id','stage','acceptance_status','launch_deadline','next_action','next_action_due','next_client_contact','next_report','risk','materials_url','call_summary'];
     if(input.acceptance_status==='accepted') { const open=db.prepare("SELECT COUNT(*) n FROM handoff_items WHERE project_id=? AND required=1 AND status!='accepted'").get(id).n; if(open) return json(res,409,{error:`Передача не может быть принята: незакрытых пунктов — ${open}`}); }
-    if(input.stage==='launched' || input.stage==='management') { const open=db.prepare("SELECT COUNT(*) n FROM launch_items WHERE project_id=? AND required=1 AND status NOT IN ('done','na')").get(id).n; if(open) return json(res,409,{error:`Запуск запрещён: незакрытых проверок — ${open}`}); }
+    if(input.stage==='launched' || input.stage==='management') {
+      const open=db.prepare("SELECT COUNT(*) n FROM launch_items WHERE project_id=? AND required=1 AND status NOT IN ('done','na')").get(id).n;
+      if(open) return json(res,409,{error:`Запуск запрещён: незакрытых проверок — ${open}`});
+      const profile=successProfile(id);
+      if(!profile || profile.readiness!=='ready') return json(res,409,{error:'Запуск запрещён: заполните паспорт результата и утверждённую структуру кампаний'});
+    }
     const entries=Object.entries(input).filter(([k])=>allowed.includes(k)); if(!entries.length)return json(res,400,{error:'Нет допустимых полей'});
     db.prepare(`UPDATE projects SET ${entries.map(([k])=>`${k}=?`).join(',')},updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(...entries.map(([,v])=>v||null),id);
     activity(id,user.id,'Обновлён проект',entries.map(([k])=>k).join(', ')); return json(res,200,{ok:true});
   }
   m=route('/api/projects/:id/all',path);
-  if(m && req.method==='GET') { const id=Number(m.id),p=projectAccess(id,user); if(!p)return json(res,404,{error:'Проект не найден'}); return json(res,200,{project:p,handoff:db.prepare('SELECT * FROM handoff_items WHERE project_id=? ORDER BY id').all(id),launch:db.prepare('SELECT * FROM launch_items WHERE project_id=? ORDER BY id').all(id),tasks:db.prepare(`SELECT t.*,u.name assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_id WHERE t.project_id=? ORDER BY CASE t.status WHEN 'blocked' THEN 0 WHEN 'doing' THEN 1 ELSE 2 END,t.due_date`).all(id),reports:db.prepare('SELECT r.*,u.name author_name FROM reports r LEFT JOIN users u ON u.id=r.created_by WHERE r.project_id=? ORDER BY r.created_at DESC').all(id),escalations:db.prepare('SELECT e.*,u.name author_name FROM escalations e LEFT JOIN users u ON u.id=e.created_by WHERE e.project_id=? ORDER BY e.created_at DESC').all(id),calls:db.prepare('SELECT c.*,u.name author_name FROM call_records c LEFT JOIN users u ON u.id=c.created_by WHERE c.project_id=? ORDER BY COALESCE(c.occurred_at,c.created_at) DESC,c.id DESC').all(id),activity:db.prepare('SELECT a.*,u.name user_name FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE a.project_id=? ORDER BY a.created_at DESC LIMIT 60').all(id)}); }
+  if(m && req.method==='GET') {
+    const id=Number(m.id),p=projectAccess(id,user); if(!p)return json(res,404,{error:'Проект не найден'});
+    return json(res,200,{
+      project:p,
+      handoff:db.prepare('SELECT * FROM handoff_items WHERE project_id=? ORDER BY id').all(id),
+      launch:db.prepare('SELECT * FROM launch_items WHERE project_id=? ORDER BY id').all(id),
+      tasks:db.prepare(`SELECT t.*,u.name assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_id WHERE t.project_id=? ORDER BY CASE t.status WHEN 'blocked' THEN 0 WHEN 'doing' THEN 1 ELSE 2 END,t.due_date`).all(id),
+      reports:db.prepare('SELECT r.*,u.name author_name FROM reports r LEFT JOIN users u ON u.id=r.created_by WHERE r.project_id=? ORDER BY r.created_at DESC').all(id),
+      escalations:db.prepare('SELECT e.*,u.name author_name FROM escalations e LEFT JOIN users u ON u.id=e.created_by WHERE e.project_id=? ORDER BY e.created_at DESC').all(id),
+      calls:db.prepare('SELECT c.*,u.name author_name FROM call_records c LEFT JOIN users u ON u.id=c.created_by WHERE c.project_id=? ORDER BY COALESCE(c.occurred_at,c.created_at) DESC,c.id DESC').all(id),
+      success_profile:successProfile(id),
+      daily_audits:db.prepare('SELECT d.*,u.name author_name FROM daily_audits d LEFT JOIN users u ON u.id=d.created_by WHERE d.project_id=? ORDER BY d.audit_date DESC,d.id DESC LIMIT 90').all(id),
+      optimization_actions:db.prepare('SELECT o.*,u.name author_name FROM optimization_actions o LEFT JOIN users u ON u.id=o.created_by WHERE o.project_id=? ORDER BY o.action_date DESC,o.id DESC LIMIT 200').all(id),
+      activity:db.prepare('SELECT a.*,u.name user_name FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE a.project_id=? ORDER BY a.created_at DESC LIMIT 60').all(id)
+    });
+  }
+  m=route('/api/projects/:pid/success-profile',path);
+  if(m && req.method==='PUT') {
+    const pid=Number(m.pid); if(!projectAccess(pid,user))return json(res,404,{error:'Проект не найден'});
+    if(!canManageProject(user))return json(res,403,{error:'Паспорт результата меняет собственник или проджект'});
+    const profile=cleanSuccessProfile(await body(req));
+    if(profile.missing.length) return json(res,400,{error:`Заполните обязательные поля паспорта результата: ${profile.missing.join(', ')}`});
+    db.prepare(`INSERT INTO client_success_profiles(project_id,business_goal,primary_kpi,target_value,monthly_budget,direct_login,metrika_counter_id,crm_source,landing_url,geo,offer,audience,restrictions,campaign_blueprint,auto_actions_enabled,readiness,updated_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(project_id) DO UPDATE SET business_goal=excluded.business_goal,primary_kpi=excluded.primary_kpi,target_value=excluded.target_value,monthly_budget=excluded.monthly_budget,direct_login=excluded.direct_login,metrika_counter_id=excluded.metrika_counter_id,crm_source=excluded.crm_source,landing_url=excluded.landing_url,geo=excluded.geo,offer=excluded.offer,audience=excluded.audience,restrictions=excluded.restrictions,campaign_blueprint=excluded.campaign_blueprint,auto_actions_enabled=excluded.auto_actions_enabled,readiness=excluded.readiness,updated_by=excluded.updated_by,updated_at=CURRENT_TIMESTAMP`).run(
+      pid,...SUCCESS_PROFILE_FIELDS.map(k=>profile[k]),profile.auto_actions_enabled,profile.readiness,user.id);
+    activity(pid,user.id,'Обновлён паспорт результата',`${profile.primary_kpi}: ${profile.target_value}`);
+    return json(res,200,successProfile(pid));
+  }
+  m=route('/api/projects/:pid/daily-audits',path);
+  if(m && req.method==='POST') {
+    const pid=Number(m.pid),x=await body(req); if(!projectAccess(pid,user))return json(res,404,{error:'Проект не найден'});
+    if(!canManageProject(user))return json(res,403,{error:'Ежедневный аудит фиксирует собственник или проджект'});
+    const sourceStatuses=new Set(['confirmed','confirmed_zero','unavailable']),statuses=new Set(['ok','attention','critical','unavailable']);
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(String(x.audit_date||'')))return json(res,400,{error:'Укажите дату аудита'});
+    if(!sourceStatuses.has(x.source_status))return json(res,400,{error:'Укажите подтверждённость данных'});
+    if(!statuses.has(x.status))return json(res,400,{error:'Укажите итог аудита'});
+    const existed=db.prepare('SELECT id FROM daily_audits WHERE project_id=? AND audit_date=?').get(pid,x.audit_date);
+    db.prepare(`INSERT INTO daily_audits(project_id,audit_date,source_status,status,impressions,clicks,spend,conversions,cpa,findings,actions,raw_reference,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(project_id,audit_date) DO UPDATE SET source_status=excluded.source_status,status=excluded.status,impressions=excluded.impressions,clicks=excluded.clicks,spend=excluded.spend,conversions=excluded.conversions,cpa=excluded.cpa,findings=excluded.findings,actions=excluded.actions,raw_reference=excluded.raw_reference,created_by=excluded.created_by,updated_at=CURRENT_TIMESTAMP`).run(
+      pid,x.audit_date,x.source_status,x.status,numberOrNull(x.impressions),numberOrNull(x.clicks),numberOrNull(x.spend),numberOrNull(x.conversions),numberOrNull(x.cpa),String(x.findings||'').trim(),String(x.actions||'').trim(),String(x.raw_reference||'').trim(),user.id);
+    activity(pid,user.id,existed?'Обновлён ежедневный аудит':'Добавлен ежедневный аудит',`${x.audit_date}: ${x.status}`);
+    return json(res,existed?200:201,{id:(existed||db.prepare('SELECT id FROM daily_audits WHERE project_id=? AND audit_date=?').get(pid,x.audit_date)).id});
+  }
+  m=route('/api/projects/:pid/optimization-actions',path);
+  if(m && req.method==='POST') {
+    const pid=Number(m.pid),x=await body(req); if(!projectAccess(pid,user))return json(res,404,{error:'Проект не найден'});
+    if(!canManageProject(user))return json(res,403,{error:'Корректировки фиксирует собственник или проджект'});
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(String(x.action_date||'')))return json(res,400,{error:'Укажите дату корректировки'});
+    if(!String(x.action||'').trim()||!String(x.rationale||'').trim())return json(res,400,{error:'Укажите действие и основание'});
+    const allowedStatus=new Set(['planned','approval_required','applied','rejected','rolled_back']),status=allowedStatus.has(x.status)?x.status:'planned';
+    const applied=status==='applied';
+    const r=db.prepare(`INSERT INTO optimization_actions(project_id,action_date,category,entity,action,rationale,risk_level,status,before_value,after_value,proof,created_by,applied_by,applied_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)`).run(pid,x.action_date,String(x.category||'other'),String(x.entity||''),String(x.action).trim(),String(x.rationale).trim(),String(x.risk_level||'low'),status,String(x.before_value||''),String(x.after_value||''),String(x.proof||''),user.id,applied?user.id:null,applied?1:0);
+    activity(pid,user.id,'Зафиксирована корректировка',`${x.action_date}: ${String(x.action).trim()}`);
+    return json(res,201,{id:Number(r.lastInsertRowid)});
+  }
   m=route('/api/projects/:pid/calls',path);
   if(m && req.method==='POST') { const pid=Number(m.pid),p=projectAccess(pid,user); if(!p)return json(res,404,{error:'Проект не найден'}); const result=addCallRecord(pid,await body(req),user); return json(res,result.duplicate?200:201,result); }
   m=route('/api/projects/:pid/handoff/:id',path);
